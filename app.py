@@ -34,15 +34,36 @@ def verify_signature(data):
     ).hexdigest()
     return expected == data.get("merchantSignature", "")
 
+def normalize_phone(phone):
+    """Повертає останні 9 цифр номера для порівняння"""
+    if not phone:
+        return None
+    digits = "".join(c for c in phone if c.isdigit())
+    return digits[-9:] if len(digits) >= 9 else digits
+
 def find_order(email=None, phone=None):
-    for field, value in [("filter[buyer_email]", email), ("filter[buyer_phone]", phone)]:
-        if not value:
-            continue
+    # Спочатку шукаємо по email
+    if email:
         resp = requests.get(f"{KEYCRM_BASE}/order", headers=HEADERS,
-                            params={field: value, "limit": 1, "sort[id]": "desc"})
+                            params={"filter[buyer_email]": email, "limit": 1, "sort[id]": "desc"})
         orders = resp.json().get("data", [])
         if orders:
             return orders[0]
+
+    # Якщо не знайшли — шукаємо по телефону (останні 9 цифр)
+    if phone:
+        phone_suffix = normalize_phone(phone)
+        # Пробуємо різні формати
+        for phone_variant in [phone, f"+38{phone_suffix}", f"+48{phone_suffix}", phone_suffix]:
+            resp = requests.get(f"{KEYCRM_BASE}/order", headers=HEADERS,
+                                params={"filter[buyer_phone]": phone_variant, "limit": 5, "sort[id]": "desc"})
+            orders = resp.json().get("data", [])
+            # Порівнюємо по останніх 9 цифрах
+            for o in orders:
+                buyer_phone = (o.get("buyer") or {}).get("phone", "")
+                if normalize_phone(buyer_phone) == phone_suffix:
+                    return o
+
     return None
 
 def add_payment(order_id, amount, reference):
