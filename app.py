@@ -1,6 +1,6 @@
 from flask import Flask, request, jsonify
 import hashlib, hmac, requests, os, logging, time
-from datetime import datetime, timezone, timedelta
+
 
 app = Flask(__name__)
 logging.basicConfig(level=logging.INFO)
@@ -9,7 +9,6 @@ KEYCRM_API_KEY = os.environ.get("KEYCRM_API_KEY")
 WFP_SECRET_KEY = os.environ.get("WFP_SECRET_KEY")
 KEYCRM_SOURCE_ID = int(os.environ.get("KEYCRM_SOURCE_ID", 2))
 KEYCRM_BASE = "https://openapi.keycrm.app/v1"
-MATCH_WINDOW_MIN = 15  # розбіжність часу до 15 хвилин
 
 HEADERS = {
     "Authorization": f"Bearer {KEYCRM_API_KEY}",
@@ -53,13 +52,10 @@ def phones_match(order_phone, wfp_phone):
         return False
     return op[-9:] == wp[-9:]
 
-def find_order_by_phone_and_time(wfp_phone, wfp_timestamp):
+def find_order_by_phone(wfp_phone):
     """
-    Шукає замовлення де:
-    1. Телефон містить номер транзакції (substring)
-    2. Замовлення створено не більше ніж MATCH_WINDOW_MIN хвилин від часу транзакції
+    Шукає найновіше замовлення де останні 9 цифр телефону збігаються
     """
-    # Беремо останні 50 замовлень (з запасом)
     resp = requests.get(
         f"{KEYCRM_BASE}/order",
         headers=HEADERS,
@@ -68,28 +64,12 @@ def find_order_by_phone_and_time(wfp_phone, wfp_timestamp):
     orders = resp.json().get("data", [])
     logging.info(f"Searching among {len(orders)} orders for phone {wfp_phone}")
 
-    wfp_time = datetime.fromtimestamp(int(wfp_timestamp), tz=timezone.utc) if wfp_timestamp else datetime.now(tz=timezone.utc)
-
     for order in orders:
-        # Перевірка телефону
         buyer = order.get("buyer") or {}
         order_phone = buyer.get("phone", "")
-        if not phones_match(order_phone, wfp_phone):
-            continue
-
-        # Перевірка часу (±15 хвилин)
-        created_at = order.get("created_at", "")
-        try:
-            order_time = datetime.fromisoformat(created_at.replace("Z", "+00:00"))
-            diff = abs((wfp_time - order_time).total_seconds() / 60)
-            if diff <= MATCH_WINDOW_MIN:
-                logging.info(f"Matched order #{order['id']} (phone: {order_phone}, diff: {diff:.1f} min)")
-                return order
-            else:
-                logging.info(f"Phone match #{order['id']} but time diff {diff:.1f} min > {MATCH_WINDOW_MIN} min")
-        except Exception as e:
-            logging.warning(f"Time parse error for order #{order.get('id')}: {e}")
-            continue
+        if phones_match(order_phone, wfp_phone):
+            logging.info(f"Matched order #{order['id']} (phone: {order_phone})")
+            return order
 
     return None
 
@@ -154,7 +134,7 @@ def webhook():
     reference = data.get("orderReference", "")
     order_date = data.get("orderDate", "")  # unix timestamp від WayForPay
 
-    order = find_order_by_phone_and_time(phone, order_date)
+    order = find_order_by_phone(phone)
 
     if order:
         result = add_payment(order["id"], amount, reference)
