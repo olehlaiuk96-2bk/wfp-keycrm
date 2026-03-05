@@ -1,11 +1,12 @@
 from flask import Flask, request, jsonify
-import hashlib, hmac, requests, os, logging
+import hashlib, hmac, requests, os, logging, time
 
 app = Flask(__name__)
 logging.basicConfig(level=logging.INFO)
 
 KEYCRM_API_KEY = os.environ.get("KEYCRM_API_KEY")
 WFP_SECRET_KEY = os.environ.get("WFP_SECRET_KEY")
+KEYCRM_SOURCE_ID = int(os.environ.get("KEYCRM_SOURCE_ID", 2))
 KEYCRM_BASE = "https://openapi.keycrm.app/v1"
 
 HEADERS = {
@@ -13,11 +14,9 @@ HEADERS = {
     "Content-Type": "application/json"
 }
 
-def verify_wayforpay_signature(data):
-    """Перевірка підпису WayForPay"""
+def verify_signature(data):
     if not WFP_SECRET_KEY:
-        return True  # Пропускаємо якщо ключ не вказаний (для тестів)
-    
+        return True
     sign_string = ";".join([
         data.get("merchantAccount", ""),
         data.get("orderReference", ""),
@@ -28,73 +27,62 @@ def verify_wayforpay_signature(data):
         data.get("transactionStatus", ""),
         str(data.get("reasonCode", ""))
     ])
-    
     expected = hmac.new(
         WFP_SECRET_KEY.encode("utf-8"),
         sign_string.encode("utf-8"),
         hashlib.md5
     ).hexdigest()
-    
     return expected == data.get("merchantSignature", "")
 
-def find_order_in_keycrm(email=None, phone=None):
-    """Шукаємо замовлення в KeyCRM по email або телефону"""
-    if email:
-        resp = requests.get(
-            f"{KEYCRM_BASE}/order",
-            headers=HEADERS,
-            params={"filter[buyer_email]": email, "limit": 1, "sort[id]": "desc"}
-        )
-        data = resp.json()
-        if data.get("data"):
-            return data["data"][0]
-    
-    if phone:
-        resp = requests.get(
-            f"{KEYCRM_BASE}/order",
-            headers=HEADERS,
-            params={"filter[buyer_phone]": phone, "limit": 1, "sort[id]": "desc"}
-        )
-        data = resp.json()
-        if data.get("data"):
-            return data["data"][0]
-    
+def find_order(email=None, phone=None):
+    for field, value in [("filter[buyer_email]", email), ("filter[buyer_phone]", phone)]:
+        if not value:
+            continue
+        resp = requests.get(f"{KEYCRM_BASE}/order", headers=HEADERS,
+                            params={field: value, "limit": 1, "sort[id]": "desc"})
+        orders = resp.json().get("data", [])
+        if orders:
+            return orders[0]
     return None
 
-def create_order_in_keycrm(wfp_data):
-    """Створюємо нове замовлення в KeyCRM"""
-    order = {
-        "source_id": int(os.environ.get("KEYCRM_SOURCE_ID", 1)),
-        "buyer": {
-            "full_name": f"{wfp_data.get('clientFirstName', '')} {wfp_data.get('clientLastName', '')}".strip(),
-            "email": wfp_data.get("clientEmail", ""),
-            "phone": wfp_data.get("clientPhone", "")
-        },
-        "products": [{
-            "name": wfp_data.get("productName", ["Woman Room підписка"])[0] if isinstance(wfp_data.get("productName"), list) else "Woman Room підписка",
-            "price": float(wfp_data.get("amount", 19)),
-            "quantity": 1
-        }],
-        "total_price": float(wfp_data.get("amount", 19)),
-        "comment": f"WayForPay | {wfp_data.get('orderReference', '')}",
-        "payment_status": "paid",
-        "payment_method": "WayForPay"
-    }
-    
-    resp = requests.post(f"{KEYCRM_BASE}/order", headers=HEADERS, json=order)
-    return resp.json()
-
-def update_order_payment(order_id, amount, reference):
-    """Оновлюємо статус оплати існуючого замовлення"""
-    resp = requests.patch(
-        f"{KEYCRM_BASE}/order/{order_id}",
+def add_payment(order_id, amount, reference):
+    resp = requests.post(
+        f"{KEYCRM_BASE}/order/{order_id}/payment",
         headers=HEADERS,
         json={
-            "payment_status": "paid",
-            "comment": f"Рекурентний платіж WayForPay | {reference} | {amount} USD"
+            "amount": float(amount),
+            "payment_method": "WayForPay",
+            "is_paid": True,
+            "description": f"WayForPay | {reference}"
         }
     )
     return resp.json()
+
+def create_order(wfp):
+    names = wfp.get("productName", ["Woman Room підписка"])
+    product_name = names[0] if isinstance(names, list) else names
+    order = {
+        "source_id": KEYCRM_SOURCE_ID,
+        "buyer": {
+            "full_name": f"{wfp.get('clientFirstName','')} {wfp.get('clientLastName','')}".strip() or "Клієнт",
+            "email": wfp.get("clientEmail", ""),
+            "phone": wfp.get("clientPhone", "")
+        },
+        "products": [{"name": product_name, "price": float(wfp.get("amount", 19)), "quantity": 1}],
+        "grand_total": float(wfp.get("amount", 19)),
+        "manager_comment": f"WayForPay | {wfp.get('orderReference', '')}",
+    }
+    resp = requests.post(f"{KEYCRM_BASE}/order", headers=HEADERS, json=order)
+    return resp.json()
+
+def wfp_response(reference, secret):
+    ts = int(time.time())
+    sig = hmac.new(
+        (secret or "test").encode(),
+        f"{reference};accept;{ts}".encode(),
+        hashlib.md5
+    ).hexdigest() if secret else "test"
+    return jsonify({"orderReference": reference, "status": "accept", "time": ts, "signature": sig})
 
 @app.route("/", methods=["GET"])
 def health():
@@ -102,55 +90,35 @@ def health():
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
-    data = request.form.to_dict() if request.form else request.json or {}
-    
-    logging.info(f"Incoming webhook: {data}")
-    
-    # Перевірка підпису
-    if not verify_wayforpay_signature(data):
-        logging.warning("Invalid signature!")
+    data = request.form.to_dict() if request.form else (request.json or {})
+    logging.info(f"Webhook received: {data}")
+
+    if not verify_signature(data):
+        logging.warning("Invalid signature")
         return jsonify({"status": "error", "message": "Invalid signature"}), 403
-    
-    transaction_status = data.get("transactionStatus", "")
-    
-    # Обробляємо тільки успішні платежі
-    if transaction_status != "Approved":
-        logging.info(f"Skipping status: {transaction_status}")
-        return jsonify({"status": "ok", "message": f"Skipped: {transaction_status}"})
-    
+
+    if data.get("transactionStatus") != "Approved":
+        logging.info(f"Skipped: {data.get('transactionStatus')}")
+        return wfp_response(data.get("orderReference", ""), WFP_SECRET_KEY)
+
     email = data.get("clientEmail")
     phone = data.get("clientPhone")
-    amount = data.get("amount")
+    amount = data.get("amount", 19)
     reference = data.get("orderReference", "")
-    
-    logging.info(f"Approved payment: {email}, {amount}")
-    
-    # Шукаємо існуюче замовлення
-    existing_order = find_order_in_keycrm(email=email, phone=phone)
-    
-    if existing_order:
-        # Оновлюємо статус оплати
-        order_id = existing_order["id"]
-        result = update_order_payment(order_id, amount, reference)
-        logging.info(f"Updated order {order_id}: {result}")
-        action = "updated"
+
+    order = find_order(email=email, phone=phone)
+
+    if order:
+        result = add_payment(order["id"], amount, reference)
+        logging.info(f"Payment added to order {order['id']}: {result}")
     else:
-        # Створюємо нове замовлення
-        result = create_order_in_keycrm(data)
-        logging.info(f"Created new order: {result}")
-        action = "created"
-    
-    # WayForPay вимагає підтвердження
-    return jsonify({
-        "orderReference": reference,
-        "status": "accept",
-        "time": int(__import__("time").time()),
-        "signature": hmac.new(
-            (WFP_SECRET_KEY or "").encode(),
-            f"{reference};accept;{int(__import__('time').time())}".encode(),
-            hashlib.md5
-        ).hexdigest() if WFP_SECRET_KEY else "test"
-    })
+        new_order = create_order(data)
+        order_id = new_order.get("id")
+        if order_id:
+            add_payment(order_id, amount, reference)
+        logging.info(f"New order created: {new_order}")
+
+    return wfp_response(reference, WFP_SECRET_KEY)
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
